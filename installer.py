@@ -4,7 +4,7 @@ import subprocess
 def install_ipa(ipa_path, udid=None):
     ipa = Path(ipa_path)
 
-    if not ipa.exists:
+    if not ipa.is_file():
         print("ipa doesn't exist")
         return False
 

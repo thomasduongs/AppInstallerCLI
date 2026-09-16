@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import locale
 from Foundation import NSBundle, NSClassFromString
 import subprocess
@@ -11,7 +11,9 @@ from pathlib import Path
 from typing import Optional
 
 import requests
+from requests.adapters import HTTPAdapter
 import srp._pysrp as srp
+from urllib3.util.retry import Retry
 
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import (
@@ -19,6 +21,8 @@ from cryptography.hazmat.primitives.ciphers import (
     algorithms,
     modes,
 )
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.exceptions import InvalidTag
 
 @dataclass
 class AnisetteData:
@@ -106,9 +110,17 @@ def get_anisette_data() -> AnisetteData:
 class AppleSession:
     apple_id: str
     dsid: str
-    idms_token: str
-    payload: dict
+    idms_token: str = field(repr=False)
+    payload: dict = field(repr=False)
     auth_type: Optional[str]
+    session_key: Optional[bytes] = field(repr=False)
+    continuation: Optional[bytes] = field(repr=False)
+
+
+@dataclass
+class XcodeToken:
+    token: str = field(repr=False)
+    expires: int
 
 srp.rfc5054_enable()
 srp.no_username_in_x()
@@ -160,6 +172,16 @@ GSA_URL = "https://gsa.apple.com/grandslam/GsService2"
 APPLE_CA_BUNDLE = str(Path(__file__).resolve().with_name("apple_root_ca.pem"))
 
 
+def apple_http_session() -> requests.Session:
+    session = requests.Session()
+    # Only retry failures while establishing a connection. A request that
+    # reached Apple must not be replayed automatically during authentication.
+    retries = Retry(total=2, connect=2, read=0, status=0, other=0,
+                    backoff_factor=0.5)
+    session.mount("https://gsa.apple.com/", HTTPAdapter(max_retries=retries))
+    return session
+
+
 def send_gsa_request(
     session: requests.Session,
     parameters: dict,
@@ -181,13 +203,19 @@ def send_gsa_request(
     }
     headers.update(anisette.headers)
 
-    response = session.post(
-        GSA_URL,
-        headers=headers,
-        data=plistlib.dumps(body),
-        timeout=15,
-        verify=APPLE_CA_BUNDLE,
-    )
+    try:
+        response = session.post(
+            GSA_URL,
+            headers=headers,
+            data=plistlib.dumps(body),
+            timeout=15,
+            verify=APPLE_CA_BUNDLE,
+        )
+    except requests.exceptions.ConnectionError as exc:
+        raise RuntimeError(
+            "Could not connect to gsa.apple.com. Check your DNS, internet "
+            "connection, VPN, or proxy settings, then try again."
+        ) from exc
 
     response.raise_for_status()
 
@@ -242,6 +270,26 @@ def derive_password(
         32
     )
 
+def load_apple_plist(decrypted: bytes) -> dict:
+    try:
+        return plistlib.loads(decrypted)
+    except plistlib.InvalidFileException:
+        # Some GSA responses contain a bare XML <dict> instead of a complete
+        # plist document. Python 3.9 needs the XML declaration/doctype to
+        # recognize that form.
+        if not decrypted.lstrip().startswith(b"<dict>"):
+            raise RuntimeError(
+                "Apple returned a plist in an unrecognized format."
+            ) from None
+
+        xml_header = (
+            b'<?xml version="1.0" encoding="UTF-8"?>\n'
+            b'<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+            b'"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        )
+        return plistlib.loads(xml_header + decrypted)
+
+
 def decrypt_spd(
     session_key: bytes,
     encrypted_data: bytes
@@ -278,23 +326,7 @@ def decrypt_spd(
         + unpadder.finalize()
     )
 
-    try:
-        return plistlib.loads(decrypted)
-    except plistlib.InvalidFileException:
-        # Some GSA responses contain a bare XML <dict> instead of a complete
-        # plist document. Python 3.9 needs the XML declaration/doctype to
-        # recognize that form.
-        if not decrypted.lstrip().startswith(b"<dict>"):
-            raise RuntimeError(
-                "Apple returned session data in an unrecognized format."
-            ) from None
-
-        xml_header = (
-            b'<?xml version="1.0" encoding="UTF-8"?>\n'
-            b'<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
-            b'"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
-        )
-        return plistlib.loads(xml_header + decrypted)
+    return load_apple_plist(decrypted)
 
 def authenticate_once(
     apple_id: str,
@@ -302,7 +334,7 @@ def authenticate_once(
     anisette: AnisetteData
 ) -> AppleSession:
 
-    http = requests.Session()
+    http = apple_http_session()
 
     # Password is intentionally empty initially.
     # We can't derive Apple's password key until the
@@ -436,6 +468,14 @@ def authenticate_once(
         .get("au")
     )
 
+    app_session_key = payload.get("sk")
+    app_continuation = payload.get("c")
+    if auth_type is None:
+        if not isinstance(app_session_key, bytes) or not app_session_key:
+            raise RuntimeError("Apple session did not contain sk.")
+        if not isinstance(app_continuation, bytes) or not app_continuation:
+            raise RuntimeError("Apple session did not contain c.")
+
     return AppleSession(
         apple_id=payload.get(
             "acname",
@@ -444,8 +484,75 @@ def authenticate_once(
         dsid=str(dsid),
         idms_token=str(idms_token),
         payload=payload,
-        auth_type=auth_type
+        auth_type=auth_type,
+        session_key=app_session_key,
+        continuation=app_continuation,
     )
+
+
+XCODE_AUTH_APP = "com.apple.gs.xcode.auth"
+
+
+def create_app_token_checksum(session_key: bytes, dsid: str, apps: list) -> bytes:
+    message = b"apptokens" + dsid.encode("utf-8")
+    for app in apps:
+        message += app.encode("utf-8")
+    return hmac.new(session_key, message, hashlib.sha256).digest()
+
+
+def decrypt_app_token(session_key: bytes, encrypted: bytes) -> bytes:
+    if not isinstance(encrypted, bytes) or len(encrypted) < 35:
+        raise RuntimeError("Encrypted app token is too short.")
+    if encrypted[:3] != b"XYZ":
+        raise RuntimeError("Unknown app-token format.")
+
+    try:
+        return AESGCM(session_key).decrypt(
+            encrypted[3:19], encrypted[19:], encrypted[:3]
+        )
+    except InvalidTag as exc:
+        raise RuntimeError("Could not authenticate Apple's app token.") from exc
+
+
+def get_xcode_token(session: AppleSession, anisette: AnisetteData) -> XcodeToken:
+    if not session.session_key or not session.continuation:
+        raise RuntimeError("Complete Apple authentication before requesting an Xcode token.")
+
+    apps = [XCODE_AUTH_APP]
+    response = send_gsa_request(
+        apple_http_session(),
+        {
+            "u": session.dsid,
+            "app": apps,
+            "c": session.continuation,
+            "t": session.idms_token,
+            "checksum": create_app_token_checksum(
+                session.session_key, session.dsid, apps
+            ),
+            "cpd": build_cpd(anisette),
+            "o": "apptokens",
+        },
+        anisette,
+    )
+
+    encrypted = response.get("et")
+    if encrypted is None:
+        raise RuntimeError("Apple did not return an encrypted app token.")
+
+    try:
+        token_plist = load_apple_plist(
+            decrypt_app_token(session.session_key, encrypted)
+        )
+        token_info = token_plist["t"][XCODE_AUTH_APP]
+        token = token_info["token"]
+        expiry = int(token_info["expiry"])
+    except (plistlib.InvalidFileException, KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("Could not parse Apple's Xcode token response.") from exc
+
+    if not isinstance(token, str) or not token:
+        raise RuntimeError("Apple did not return an Xcode token.")
+
+    return XcodeToken(token=token, expires=expiry)
 
 def two_factor_headers(
     apple_session: AppleSession,
