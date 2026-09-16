@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 import hashlib
 import hmac
 import plistlib
+from pathlib import Path
+from typing import Optional
 
 import requests
 import srp._pysrp as srp
@@ -65,13 +67,11 @@ def get_anisette_data() -> AnisetteData:
     mac_version = shell(["sw_vers", "-productVersion"])
     mac_build = shell(["sw_vers", "-buildVersion"])
 
-    xcode_client_version = "25183.54.10"
-
     client_info = (
         f"<{mac_model}> "
         f"<macOS;{mac_version};{mac_build}> "
         f"<com.apple.AuthKit/1 "
-        f"(com.apple.dt.Xcode/{xcode_client_version})>"
+        f"(com.apple.akd/1.0)>"
     )
 
     current_locale = locale.getlocale()[0] or "en_US"
@@ -97,7 +97,10 @@ def get_anisette_data() -> AnisetteData:
         "X-Apple-Locale": current_locale,
     }
 
-    return AnisetteData(headers=headers)
+    return AnisetteData(
+        headers=headers,
+        client_info=client_info
+    )
 
 @dataclass
 class AppleSession:
@@ -105,7 +108,7 @@ class AppleSession:
     dsid: str
     idms_token: str
     payload: dict
-    auth_type: str | None
+    auth_type: Optional[str]
 
 srp.rfc5054_enable()
 srp.no_username_in_x()
@@ -151,6 +154,10 @@ def build_cpd(anisette: AnisetteData):
     }
 
 GSA_URL = "https://gsa.apple.com/grandslam/GsService2"
+# Apple's authentication endpoint chains to Apple Root CA, which is trusted by
+# macOS but not included in the CA bundle used by this Python installation.
+# Source: https://www.apple.com/appleca/AppleIncRootCertificate.cer
+APPLE_CA_BUNDLE = str(Path(__file__).resolve().with_name("apple_root_ca.pem"))
 
 
 def send_gsa_request(
@@ -172,12 +179,14 @@ def send_gsa_request(
             "akd/1.0 CFNetwork/978.0.7 Darwin/18.7.0",
         "X-MMe-Client-Info": anisette.client_info,
     }
+    headers.update(anisette.headers)
 
     response = session.post(
         GSA_URL,
         headers=headers,
         data=plistlib.dumps(body),
-        timeout=15
+        timeout=15,
+        verify=APPLE_CA_BUNDLE,
     )
 
     response.raise_for_status()
@@ -269,7 +278,23 @@ def decrypt_spd(
         + unpadder.finalize()
     )
 
-    return plistlib.loads(decrypted)
+    try:
+        return plistlib.loads(decrypted)
+    except plistlib.InvalidFileException:
+        # Some GSA responses contain a bare XML <dict> instead of a complete
+        # plist document. Python 3.9 needs the XML declaration/doctype to
+        # recognize that form.
+        if not decrypted.lstrip().startswith(b"<dict>"):
+            raise RuntimeError(
+                "Apple returned session data in an unrecognized format."
+            ) from None
+
+        xml_header = (
+            b'<?xml version="1.0" encoding="UTF-8"?>\n'
+            b'<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+            b'"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        )
+        return plistlib.loads(xml_header + decrypted)
 
 def authenticate_once(
     apple_id: str,
@@ -466,7 +491,8 @@ def request_two_factor_code(
             apple_session,
             anisette
         ),
-        timeout=15
+        timeout=15,
+        verify=APPLE_CA_BUNDLE,
     )
 
     response.raise_for_status()
@@ -492,7 +518,8 @@ def submit_two_factor_code(
         "https://gsa.apple.com/"
         "grandslam/GsService2/validate",
         headers=headers,
-        timeout=15
+        timeout=15,
+        verify=APPLE_CA_BUNDLE,
     )
 
     response.raise_for_status()
